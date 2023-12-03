@@ -1,0 +1,441 @@
+DATASET = 'Images'
+
+BASE_DIR = './' + DATASET
+WORKING_DIR = './'
+
+directory = BASE_DIR
+
+"""## Load the captions"""
+
+c_path = os.path.join(BASE_DIR, 'captions.txt')
+with open(c_path, 'r') as f:
+    captions_doc = f.read()
+
+c_original = sc.parallelize(captions_doc.split('\n')[1:])
+
+captions = c_original.map(lambda x: x.split(',')) \
+    .filter(lambda x: len(x) > 1) \
+    .map(lambda x: (x[0].split('.')[0], x[1:]))
+
+mapping = captions.reduceByKey(lambda x, y: x + y).collectAsMap()
+
+image_ids = captions.map(lambda x: x[0])
+image_ids.take(10)
+
+len(mapping)
+
+mapping['1000268201_693b08cb0e']
+
+"""## Preprocess data"""
+
+captions_processed = captions \
+    .map(lambda x: (x[0], x[1][0].lower())) \
+    .map(lambda x: (x[0], re.sub('[^A-Za-z]', ' ', x[1]))) \
+    .map(lambda x: (x[0], 'start ' + x[1] + ' end')) \
+    .map(lambda x: (x[0], [re.sub('\s+', ' ', x[1])]))
+
+mapping = captions_processed \
+    .reduceByKey(lambda x, y: x + y) \
+    .collectAsMap()
+
+mapping['1000268201_693b08cb0e']
+
+captions = captions_processed.map(lambda x: x[1][0]).collect()
+captions[:10]
+
+tzer = Tokenizer()
+tzer.fit_on_texts(captions)
+
+num_tokens = 0
+for cap in captions:
+    words_count = len(cap.split())
+    if words_count > num_tokens:
+        num_tokens = words_count
+
+print(num_tokens)
+
+"""## Extract the image features"""
+
+vgg = VGG16()
+vgg = Model(vgg.inputs, vgg.layers[-2].output)
+
+
+def vgg16_features(img_name):
+    image_id = img_name.split('.')[0]
+
+    img = img_to_array(
+        load_img(
+            BASE_DIR + '/' + img_name,
+            target_size=(224, 224)
+        )
+    )
+
+    img = preprocess_input(
+        img.reshape(
+            (1, img.shape[0], img.shape[1], img.shape[2])
+        )
+    )
+
+    return image_id, vgg.predict(img, verbose=0)
+
+all_files = sc.parallelize(os.listdir(directory))
+image_file_names = all_files.filter(lambda x: x.endswith(".jpg"))
+
+features = {}
+directory = BASE_DIR
+
+for img_name in tqdm(image_file_names.collect()):
+    id, f = vgg16_features(img_name)
+    features[id] = f
+
+"""## CNN and LTSM RNN model"""
+
+def one_hot_encode(character, char_to_idx, char_size):
+    encoded = np.zeros((char_size, 1))
+    encoded[char_to_idx[character]] = 1
+    return encoded
+
+
+def xavier_normalized_init(i_shape, o_shape):
+    return np.random.uniform(-1, 1, (o_shape, i_shape)) \
+        * np.sqrt(6 / (i_shape + o_shape))
+
+
+def softmax_activation(x):
+    return np.exp(x) / np.sum(np.exp(x))
+
+
+def tanh_activation(x):
+    return np.tanh(x)
+
+
+def tanh_activation_derivative(x):
+    return 1 - x ** 2
+
+
+def sigmoid_activation(x):
+    return 1 / (1 + np.exp(-x))
+
+
+def sigmoid_activation_derivative(x):
+    return x * (1 - x)
+
+
+class LSTM:
+    def __init__(self, input_size, hidden_size, output_size, num_epochs, learning_rate):
+        self.learning_rate = learning_rate
+        self.hidden_size = hidden_size
+        self.num_epochs = num_epochs
+
+        self.forget_gate_weights = xavier_normalized_init(
+            input_size, hidden_size)
+        self.forget_gate_biases = np.zeros((hidden_size, 1))
+
+        self.input_gate_weights = xavier_normalized_init(
+            input_size, hidden_size)
+        self.input_gate_biases = np.zeros((hidden_size, 1))
+
+        self.candidate_gate_weights = xavier_normalized_init(
+            input_size, hidden_size)
+        self.candidate_gate_biases = np.zeros((hidden_size, 1))
+
+        self.output_gate_weights = xavier_normalized_init(
+            input_size, hidden_size)
+        self.output_gate_biases = np.zeros((hidden_size, 1))
+
+        self.final_gate_weights = xavier_normalized_init(
+            hidden_size, output_size)
+        self.final_gate_biases = np.zeros((output_size, 1))
+
+    def reset_network_memory(self):
+        self.concatenated_inputs = {}
+
+        self.hidden_states = {-1: np.zeros((self.hidden_size, 1))}
+        self.cell_states = {-1: np.zeros((self.hidden_size, 1))}
+
+        self.activation_outputs = {}
+        self.candidate_gates = {}
+        self.output_gates = {}
+        self.forget_gates = {}
+        self.input_gates = {}
+        self.outputs = {}
+
+    def forward_propagation(self, inputs):
+        self.reset_network_memory()
+        outputs = []
+
+        for time_step in range(len(inputs)):
+            self.concatenated_inputs[time_step] = np.concatenate(
+                (self.hidden_states[time_step - 1], inputs[time_step]))
+
+            self.forget_gates[time_step] = sigmoid_activation(
+                np.dot(self.forget_gate_weights, self.concatenated_inputs[time_step]) + self.forget_gate_biases)
+
+            self.input_gates[time_step] = sigmoid_activation(
+                np.dot(self.input_gate_weights, self.concatenated_inputs[time_step]) + self.input_gate_biases)
+
+            self.candidate_gates[time_step] = tanh_activation(
+                np.dot(self.candidate_gate_weights, self.concatenated_inputs[time_step]) + self.candidate_gate_biases)
+
+            self.output_gates[time_step] = sigmoid_activation(
+                np.dot(self.output_gate_weights, self.concatenated_inputs[time_step]) + self.output_gate_biases)
+
+            self.cell_states[time_step] = (
+                self.forget_gates[time_step] * self.cell_states[time_step - 1] +
+                self.input_gates[time_step] * self.candidate_gates[time_step]
+            )
+
+            self.hidden_states[time_step] = self.output_gates[time_step] * \
+                tanh_activation(self.cell_states[time_step])
+
+            outputs.append(np.dot(self.final_gate_weights,
+                           self.hidden_states[time_step]) + self.final_gate_biases)
+
+        return outputs
+
+    def backward_propagation(self, errors, inputs):
+        d_forget_gate_weights, d_forget_gate_biases = 0, 0
+        d_input_gate_weights, d_input_gate_biases = 0, 0
+        d_candidate_gate_weights, d_candidate_gate_biases = 0, 0
+        d_output_gate_weights, d_output_gate_biases = 0, 0
+        d_final_gate_weights, d_final_gate_biases = 0, 0
+
+        dh_next, dc_next = np.zeros_like(
+            self.hidden_states[0]), np.zeros_like(self.cell_states[0])
+
+        for time_step in reversed(range(len(inputs))):
+            error = errors[time_step]
+
+            d_final_gate_weights += np.dot(error,
+                                           self.hidden_states[time_step].T)
+            d_final_gate_biases += error
+
+            d_hidden_state = np.dot(self.final_gate_weights.T, error) + dh_next
+
+            d_output_gate = tanh_activation(self.cell_states[time_step]) * d_hidden_state * sigmoid_activation_derivative(
+                self.output_gates[time_step])
+            d_output_gate_weights += np.dot(d_output_gate, inputs[time_step].T)
+            d_output_gate_biases += d_output_gate
+
+            d_cell_state = (
+                tanh_activation_derivative(tanh_activation(self.cell_states[time_step])) *
+                self.output_gates[time_step] * d_hidden_state + dc_next
+            )
+
+            d_forget_gate = (
+                d_cell_state * self.cell_states[time_step - 1] *
+                sigmoid_activation_derivative(
+                    self.forget_gates[time_step])
+            )
+            d_forget_gate_weights += np.dot(d_forget_gate, inputs[time_step].T)
+            d_forget_gate_biases += d_forget_gate
+
+            d_input_gate = (
+                d_cell_state * self.candidate_gates[time_step] *
+                sigmoid_activation_derivative(
+                    self.input_gates[time_step])
+            )
+            d_input_gate_weights += np.dot(d_input_gate, inputs[time_step].T)
+            d_input_gate_biases += d_input_gate
+
+            d_candidate_gate = (
+                d_cell_state * self.input_gates[time_step] *
+                tanh_activation_derivative(
+                    self.candidate_gates[time_step])
+            )
+            d_candidate_gate_weights += np.dot(d_candidate_gate,
+                                               inputs[time_step].T)
+            d_candidate_gate_biases += d_candidate_gate
+
+            d_concatenated_input = (
+                np.dot(self.forget_gate_weights.T, d_forget_gate) +
+                np.dot(self.input_gate_weights.T, d_input_gate) +
+                np.dot(self.candidate_gate_weights.T, d_candidate_gate) +
+                np.dot(self.output_gate_weights.T, d_output_gate)
+            )
+
+            dh_next = d_concatenated_input[:self.hidden_size, :]
+            dc_next = self.forget_gates[time_step] * d_cell_state
+
+        gradients = [d_forget_gate_weights, d_forget_gate_biases, d_input_gate_weights, d_input_gate_biases,
+                     d_candidate_gate_weights, d_candidate_gate_biases, d_output_gate_weights, d_output_gate_biases,
+                     d_final_gate_weights, d_final_gate_biases]
+
+        for gradient in gradients:
+            np.clip(gradient, -1, 1, out=gradient)
+
+        self.forget_gate_weights += d_forget_gate_weights * self.learning_rate
+        self.forget_gate_biases += d_forget_gate_biases * self.learning_rate
+
+        self.input_gate_weights += d_input_gate_weights * self.learning_rate
+        self.input_gate_biases += d_input_gate_biases * self.learning_rate
+
+        self.candidate_gate_weights += d_candidate_gate_weights * self.learning_rate
+        self.candidate_gate_biases += d_candidate_gate_biases * self.learning_rate
+
+        self.output_gate_weights += d_output_gate_weights * self.learning_rate
+        self.output_gate_biases += d_output_gate_biases * self.learning_rate
+
+        self.final_gate_weights += d_final_gate_weights * self.learning_rate
+        self.final_gate_biases += d_final_gate_biases * self.learning_rate
+
+vocab_size = len(tzer.word_index) + 1
+print(vocab_size)
+
+# Define Input Layers
+img_in = Input(shape=(4096,))
+txt_in = Input(shape=(num_tokens,))
+
+# Image Feature Extraction
+img_drop = Dropout(0.4)(img_in)
+img_dense = Dense(256, activation='relu')(img_drop)
+
+# Text Processing
+txt_emb = Embedding(vocab_size, 256, mask_zero=True)(txt_in)
+txt_drop = Dropout(0.4)(txt_emb)
+txt_lstm = LSTM(256)(txt_drop)
+
+merged_features = add([img_dense, txt_lstm])
+
+# Decoder Layers
+decoder_dense1 = Dense(256, activation='relu')(merged_features)
+out_dense = Dense(vocab_size, activation='softmax')(decoder_dense1)
+
+model = Model([img_in, txt_in], out_dense)
+model.compile(optimizer='adam', loss='categorical_crossentropy')
+
+"""# Train Model"""
+
+image_ids = list(mapping.keys())
+
+split_ratio = 0.90
+split_index = int(len(image_ids) * split_ratio)
+
+train_ids = image_ids[:split_index]
+test_ids = image_ids[split_index:]
+
+train = {id: mapping[id] for id in train_ids}
+test = {id: mapping[id] for id in test_ids}
+
+epochs = 1
+batch_size = 64
+steps_per_epoch = len(train) // batch_size
+
+def generate_data():
+    X_img, X_seq, y = [], [], []
+    curr_count = 0
+
+    while True:
+        for id in train:
+            curr_count += 1
+            caps = mapping[id]
+
+            for cap in caps:
+                seq = tzer.texts_to_sequences([cap])[0]
+
+                for i in range(1, len(seq)):
+                    i_seq, o_seq = seq[:i], seq[i]
+                    i_seq = pad_sequences([i_seq], maxlen=num_tokens)[0]
+                    o_seq = to_categorical([o_seq], num_classes=vocab_size)[0]
+
+                    X_img.append(features[id][0])
+                    X_seq.append(i_seq)
+                    y.append(o_seq)
+
+            if curr_count == batch_size:
+                X_img, X_seq, y = np.array(X_img), np.array(X_seq), np.array(y)
+                yield [X_img, X_seq], y
+                X_img, X_seq, y = [], [], []
+                curr_count = 0
+
+for i in range(epochs):
+    gen = generate_data()
+    model.fit(gen, steps_per_epoch=steps_per_epoch, epochs=1, verbose=1)
+
+"""# Generate Captions for the Image"""
+
+def idx_to_token(integer):
+    for token, index in tzer.word_index.items():
+        if index == integer:
+            return token
+    return None
+
+def pred_caption(model, image):
+    input_txt = 'start'
+
+    for _ in range(num_tokens):
+        seq = tzer.texts_to_sequences([input_txt])[0]
+        seq = pad_sequences([seq], num_tokens)
+
+        predictions = model.predict([image, seq], verbose=0)
+        predicted_index = np.argmax(predictions)
+
+        pred_token = idx_to_token(predicted_index)
+
+        if pred_token is None:
+            break
+
+        input_txt += " " + pred_token
+        if pred_token == 'end':
+            break
+
+    return input_txt
+
+"""# Model Validation"""
+
+true_caps, pred_caps = list(), list()
+
+for key in tqdm(test):
+    true_caps_list = [caption.split() for caption in mapping[key]]
+
+    pred_cap = pred_caption(model, features[key])
+    pred_list = pred_cap.split()
+
+    true_caps.append(true_caps_list)
+    pred_caps.append(pred_list)
+
+# Calculate BLEU score
+score_1 = corpus_bleu(
+    true_caps, pred_caps, weights=(1.0, 0, 0, 0))
+score_2 = corpus_bleu(
+    true_caps, pred_caps, weights=(0.5, 0.5, 0, 0))
+
+print("BLEU-1: %f" % score_1)
+print("BLEU-2: %f" % score_2)
+
+"""## Results"""
+
+def load_img(img_name):
+    id = img_name.split('.')[0]
+    img_path = os.path.join(BASE_DIR, '', img_name)
+
+    return id, Image.open(img_path)
+
+
+def display_caps(caps, cap_type):
+    print(f'{cap_type} Captions:')
+    for cap in caps:
+        print(cap)
+
+
+def generate_and_display_caption(image_name, model, features, mapping):
+    image_id, image = load_img(image_name)
+
+    captions = mapping[image_id]
+    display_caps(captions, 'Actual')
+
+    y_pred = pred_caption(model, features[image_id])
+    print('Predicted:')
+    print(y_pred)
+
+    plt.imshow(image)
+    plt.show()
+
+generate_and_display_caption(
+    "1001773457_577c3a7d70.jpg", model, features, mapping)
+
+generate_and_display_caption(
+    "1002674143_1b742ab4b8.jpg", model, features, mapping)
+
+generate_and_display_caption(
+    "101669240_b2d3e7f17b.jpg", model, features, mapping)
