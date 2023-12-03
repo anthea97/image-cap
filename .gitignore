@@ -1,3 +1,5 @@
 .idea
 .ipynb_checkpoints
 features.pkl
+flickr8k/*
+flickr30k/*
