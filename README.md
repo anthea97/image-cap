@@ -1,7 +1,14 @@
+## Repository for the project
+https://github.com/anthea97/image-cap
+ 
+## Team members
+- Hima Sai Kiran Prudhivi HXP220011
+- Anthea Abreo AXA210122
+- Naga Sri Harsha Vadrevu NXV210002
+- Lakshmi Harshitha Kamma HLK220000
+
 ## Dataset
-
 - https://www.kaggle.com/datasets/adityajn105/flickr8k
-
 - Dataset is also available in the /Images folder
 
 ## Install libraries
